@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -39,23 +40,47 @@ impl Config {
 }
 
 pub struct Node {
-    pub peers: Arc<Mutex<Vec<SocketAddr>>>,
+    pub peers: Vec<SocketAddr>,
     pub period: i32,
     pub addr: SocketAddr,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum MessageData {
+    Peers(Vec<SocketAddr>),
+    Message(String)
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Message {
     command: String,
-    data: Option<Vec<SocketAddr>>,
+    data: Option<MessageData>,
     addr: SocketAddr,
 }
 
-fn send_message(msg: &Message, addr: SocketAddr) -> Result<(), std::io::Error> {
-    let message_vector = serde_json::to_vec(&msg)?;
-    let mut stream = TcpStream::connect(addr)?;
-    stream.write_all(&message_vector)?;
-    Ok(())
+fn send_message(start_time: Instant, msg: &Message, addr: SocketAddr) -> Result<(), std::io::Error> {
+    match &msg.data {
+        Some(MessageData::Peers(ref _peers)) => {
+            let message_vector = serde_json::to_vec(&msg)?;
+            let mut stream = TcpStream::connect(addr)?;
+            stream.write_all(&message_vector)?;
+            Ok(())
+        },
+        Some(MessageData::Message(ref message)) => {
+            println!("{:?} - Sending message {} to {:?}", format_duration(start_time.elapsed()), message, addr);
+
+            let message_vector = serde_json::to_vec(&msg)?;
+            let mut stream = TcpStream::connect(addr)?;
+            stream.write_all(&message_vector)?;
+            Ok(())
+        },
+        None => {
+            let message_vector = serde_json::to_vec(&msg)?;
+            let mut stream = TcpStream::connect(addr)?;
+            stream.write_all(&message_vector)?;
+            Ok(())
+        }
+    }
 }
 
 impl Node {
@@ -63,17 +88,17 @@ impl Node {
         let addr = format!("127.0.0.1:{}", config.port).parse().expect("Unable to parse socket address.");
 
         Node {
-            peers: Arc::new(Mutex::new(Vec::new())),
+            peers: Vec::new(),
             period: config.period,
             addr,
         }
     }
 
-    pub fn connect(&self, addr: SocketAddr) {
+    pub fn connect(&mut self, start_time:Instant, addr: SocketAddr) {
         {
-            let mut peers = self.peers.lock().unwrap();
+            let peers = self.peers.clone();
             if !peers.contains(&addr) {
-                peers.push(addr);
+                self.peers.push(addr);
             }
         }
 
@@ -83,20 +108,133 @@ impl Node {
             addr: self.addr,
         };
 
-        if let Err(e) = send_message(&message, addr) {
+        if let Err(e) = send_message(start_time, &message, addr) {
             eprintln!("Failed to send message to {}: {}", addr, e);
         }
     }
 
-    pub fn start(&self) {
+    fn handle_connection(
+        stream: TcpStream,
+        peers_clone: Arc<Mutex<Vec<SocketAddr>>>,
+        node_addr: SocketAddr,
+        start_time: Instant
+    )
+    {
+        let mut reader = BufReader::new(stream);
+        let mut buf = String::new();
+
+        match reader.read_line(&mut buf) {
+            Ok(0) => return, // Connection was closed
+            Ok(_) => {
+                let recv_msg: Message = match serde_json::from_str(&buf) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        eprintln!("Failed to deserialize message: {}", e);
+                        return;
+                    }
+                };
+
+                let mut peers= peers_clone.lock().unwrap();
+
+                match recv_msg.command.as_str() {
+                    ".syc" => {
+                        // add the received node address
+                        // in the peers list of parent node
+                        peers.push(recv_msg.addr);
+
+                        let peers_value = peers.clone();
+
+                        let msg = Message {
+                            command: ".upd".to_string(),
+                            data: Some(MessageData::Peers(peers_value.to_owned())),
+                            addr: node_addr,
+                        };
+
+                        // send to all peers
+                        for peer in peers.iter() {
+                            if let Err(e) = send_message(start_time, &msg, *peer) {
+                                eprintln!("Failed to send message to {}: {}", peer, e);
+                            }
+                        }
+                    }
+                    ".upd" => {
+
+                        // update the peers list
+                        // of the child node
+                        let recv_msg_data = recv_msg.data;
+
+                        match recv_msg_data {
+                            Some(MessageData::Peers(ref peer_list)) => {
+                                for peer in peer_list.clone() {
+                                    if !peers.contains(&peer) && peer != node_addr {
+                                        peers.push(peer);
+                                    }
+                                }
+
+                                println!("{:?} - Connected to the peers at {:?}", format_duration(start_time.elapsed()), peers.clone());
+                            },
+                            _ => {
+                                println!("Error while updating peer list.")
+                            }
+                        }
+
+                    },
+                    ".random-message" => {
+
+                        let recv_msg_data = recv_msg.data;
+
+                        match recv_msg_data {
+                            Some(MessageData::Message(ref msg)) => {
+                                // Handle random message
+                                println!("{:?} - Received message {:?} from {:?}", format_duration(start_time.elapsed()), msg, recv_msg.addr);
+                            },
+                            _ => {
+                                println!("Error while updating peer list.")
+                            }
+                        }
+                    },
+                    _ => return,
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to read from stream: {}", e);
+                return;
+            }
+        }
+    }
+
+    pub fn start(&mut self, start_time: Instant) {
+
         let listener = TcpListener::bind(self.addr).unwrap();
+        println!("{:?} - My address is {:?}", format_duration(start_time.elapsed()), self.addr);
 
-        println!("{} - My address is {:?}", get_current_timestamp(), self.addr);
+        let peers = Arc::new(Mutex::new(self.peers.clone()));
 
-        let peers = Arc::clone(&self.peers);
-        let node_addr = self.addr;
-
+        // The rest of your code can go here
+        // For example, you can implement periodic message sending:
+        let period = self.period;
+        let peers_clone_1 = Arc::clone(&peers);
+        let node_addr_clone_1 = self.addr.clone();
         thread::spawn(move || {
+            // Perform periodic tasks here
+            loop {
+                thread::sleep(std::time::Duration::from_secs(period as u64));
+                let vec = peers_clone_1.lock().unwrap();
+                let msg = Message {
+                    command: ".random-message".to_string(),
+                    data: Some(MessageData::Message("[random message]".parse().unwrap())),
+                    addr: node_addr_clone_1,
+                };
+
+                for peer in vec.iter() {
+                    if let Err(e) = send_message(start_time, &msg, *peer) {
+                        eprintln!("Failed to send random message to {}: {}", peer, e);
+                    }
+                }
+            }
+        });
+
+        loop {
             for stream in listener.incoming() {
                 let stream = match stream {
                     Ok(s) => s,
@@ -106,51 +244,28 @@ impl Node {
                     }
                 };
 
-                let mut reader = BufReader::new(stream);
-                let mut buf = String::new();
+                // create a mutex of self and then modify it after returning from connection.
+                let node_addr_clone_2 = self.addr.clone();
 
-                match reader.read_line(&mut buf) {
-                    Ok(0) => continue, // Connection was closed
-                    Ok(_) => {
-                        let recv_msg: Message = match serde_json::from_str(&buf) {
-                            Ok(msg) => msg,
-                            Err(e) => {
-                                eprintln!("Failed to deserialize message: {}", e);
-                                continue;
-                            }
-                        };
+                let peers_clone_2 = Arc::clone(&peers);
 
-                        match recv_msg.command.as_str() {
-                            ".syc" => {
-                                let peers_clone = peers.lock().unwrap().clone();
-                                let msg = Message {
-                                    command: ".upd".to_string(),
-                                    data: Some(peers_clone),
-                                    addr: node_addr,
-                                };
-
-                                if let Err(e) = send_message(&msg, recv_msg.addr) {
-                                    eprintln!("Failed to send message to {}: {}", recv_msg.addr, e);
-                                }
-                            }
-                            ".random-message" => {
-                                // Handle random message
-                            }
-                            _ => continue,
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to read from stream: {}", e);
-                        continue;
-                    }
-                }
+                thread::spawn(move || {
+                    Self::handle_connection(
+                        stream,
+                        peers_clone_2,
+                        node_addr_clone_2,
+                        start_time
+                    );
+                }).join().unwrap();
             }
-        });
-
-        // TODO: Implement periodic message sending
+        }
     }
 }
 
-pub fn get_current_timestamp() -> String {
-    chrono::Local::now().format("%H:%M:%S").to_string()
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
 }
